@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.venv/
+memory/
+*.md
+!README.md
+!SOUL.md
+!IDENTITY.md
+!USER.md
+!AGENTS.md
+!*.md
