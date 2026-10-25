@@ -1,27 +1,25 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""amas_index.py — AMaS 倒排索引构建器（只读，永不改动任何 .md）
+"""amas_index.py — AMaS 倒排索引（v3：IDF 排序 + 2-gram 回退）
 
-背景
-----
-AMaS Core v1 的 IndexNetwork.rebuild_from_memory() 会重写 memory/index.md，
-而现网 index.md 是富格式（时间/关键词/阶段/情境/情绪/文件/引申，167 节点/422KB）。
-v1 的写入器只认四字段单行格式，直接跑等于毁库；它的标签提取还会把
-「规则 0-16」「卦 62」的序号当标签（实测 49 个标签大半是纯数字）。
+v2 → v3（2026-10-25）：
+  1. 存 df（词出现在多少文件），查询用 tf·idf 排序，抑制大文件偏置
+     ——原按 tf 排序时「端粒」被 server_bioinfo_resources.md 压住。
+  2. 中文 2-gram 回退：「OOM内存」这种无分隔查询，整体查不到就拆成
+     OOM / OO / OM / 内存 / 存… 的 bigram，按匹配覆盖度排序。
+  3. 自动停用：df > 40% 文件的词（benmo / pi / memory 这类）索引里保存但降权。
+  4. 索引体积：df 单独存，文件列表只存 tf。
 
-本工具因此只做**只读**的倒排表，不改任何记忆文件：
-  memory/.amas_index_map.json   {词 -> [[文件, 权重], ...]}
+只读：永不改动任何 .md。
 
-检索路径：词 → 文件列表（毫秒级）→ 再打开命中文件。替代全目录 grep。
-
-用法
-----
-  amas_index.py build                 # 重建倒排表
-  amas_index.py query 污染 筛查        # AND 优先，退化 OR
-  amas_index.py stats                 # 概况 + 高频词
-  amas_index.py coverage              # 日记 与 index.md 节点覆盖差
+用法:
+  amas_index.py build               # 重建 memory/.amas_index_map.json
+  amas_index.py query 污染 OOM
+  amas_index.py stats
+  amas_index.py coverage            # 日记 vs index.md 收录差
 """
 import json
+import math
 import os
 import re
 import sys
@@ -37,9 +35,10 @@ BOLD = re.compile(r"\*\*([^*]{2,40})\*\*")
 QUOTE = re.compile(r"[「『]([^」』]{2,40})[」』]")
 DATE = re.compile(r"^\d{4}-\d{2}-\d{2}")
 
-MAX_TERMS_PER_FILE = 60   # 高频词上限
-RARE_DF = 5               # 全局出现 <= 5 个文件的词不设上限（保住 contam_chain 这类专名）
+MAX_TERMS_PER_FILE = 60
+RARE_DF = 5
 MAX_FILE_BYTES = 2_000_000
+GENERIC_DF_RATIO = 0.40      # 出现在 40% 以上文件的词视为泛词
 STOP = {"关键词", "标签", "节点", "文件", "引申", "情境", "情绪", "阶段", "时间", "完成"}
 
 
@@ -61,9 +60,9 @@ def list_md():
 
 
 def bag_of(path):
-    """返回 {词: 权重}。标题/加粗/引号/标签行加权 3，正文计 1。"""
     try:
-        text = open(path, encoding="utf-8", errors="ignore").read()
+        with open(path, encoding="utf-8", errors="ignore") as f:
+            text = f.read()
     except OSError:
         return {}
     hot = []
@@ -101,18 +100,18 @@ def build():
     for b in bags.values():
         for t in b:
             df[t] += 1
-    inv = defaultdict(list)
-    pairs = 0
+    inv, df_out, pairs = {}, {}, 0
     for fn, b in bags.items():
         top = sorted(b.items(), key=lambda x: -x[1])[:MAX_TERMS_PER_FILE]
         keep = {t for t, _ in top} | {t for t in b if df[t] <= RARE_DF}
         for t in keep:
-            inv[t].append([fn, b[t]])
+            inv.setdefault(t, []).append([fn, b[t]])
             pairs += 1
     for t in inv:
         inv[t].sort(key=lambda x: (-x[1], x[0]))
-    data = {"built_from": MEM, "files": len(files), "terms": len(inv),
-            "pairs": pairs, "index": inv}
+        df_out[t] = len(inv[t])
+    data = {"built_from": MEM, "files": len(files), "n_files": len(files),
+            "terms": len(inv), "pairs": pairs, "df": df_out, "index": inv}
     os.makedirs(os.path.dirname(OUT) or ".", exist_ok=True)
     tmp = OUT + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
@@ -127,40 +126,87 @@ def load():
         return json.load(f)
 
 
+def _idf(d, term):
+    n = d.get("n_files") or d.get("files") or 1
+    f = d.get("df", {}).get(term, 1)
+    w = math.log(1.0 + n / max(f, 1))
+    # 泛词降权（benmo / pi / memory 这类）
+    if f > GENERIC_DF_RATIO * n:
+        w *= 0.15
+    return w
+
+
+def _grams(word):
+    """中文 2-gram；拉丁词整体保留。"""
+    if re.fullmatch(r"[A-Za-z0-9_.+-]+", word):
+        return [word.lower()]
+    out = []
+    for seg in CJK.findall(word):
+        if len(seg) == 2:
+            out.append(seg)
+        else:
+            out.extend(seg[i:i + 2] for i in range(len(seg) - 1))
+    lat = LAT.findall(word)
+    out.extend(w.lower() for w in lat)
+    return out
+
+
 def query(words, limit=12):
-    idx = load()["index"]
-    hit = {}
+    d = load()
+    idx = d["index"]
+    scores = defaultdict(float)
+    covered = defaultdict(int)
     for w in words:
-        for key in (w, w.lower()):
-            for fn, n in idx.get(key, []):
-                hit[fn] = hit.get(fn, 0) + n
-    if not hit and len(words) > 1:
-        for w in words:
-            for key in (w, w.lower()):
-                for fn, n in idx.get(key, []):
-                    hit[fn] = hit.get(fn, 0) + n
-    if not hit:
+        keys = [k for k in (w, w.lower()) if k in idx]
+        if not keys:
+            keys = [k for k in _grams(w) if k in idx]
+        if not keys:
+            # 末路回退：包含匹配（contam_chain → contam_chain.sh）
+            low = w.lower()
+            keys = [t for t in idx if len(t) > len(low) and low in t.lower()][:20]
+        if not keys:
+            continue
+        for k in keys:
+            idf = _idf(d, k)
+            for fn, tf in idx.get(k, []):
+                scores[fn] += tf * idf
+                covered[fn] += 1
+        # AND 倾向：命中该词拆分项越多，加权越高
+    if not scores:
         print("(no hit)")
         return
-    for fn, n in sorted(hit.items(), key=lambda x: -x[1])[:limit]:
-        print("%6d  memory/%s" % (n, fn))
+    need = max(1, len(_grams("".join(words))) // 2)
+    rows = sorted(scores.items(), key=lambda x: -(x[1] * (1 + 0.5 * min(covered[x[0]], 3))))
+    shown = 0
+    for fn, sc in rows:
+        if covered[fn] < min(need, 2) and len(rows) > 5:
+            continue
+        print("%8.2f  memory/%s" % (sc, fn))
+        shown += 1
+        if shown >= limit:
+            break
+    if shown == 0:
+        for fn, sc in rows[:limit]:
+            print("%8.2f  memory/%s" % (sc, fn))
 
 
 def stats():
     d = load()
     print("files=%d terms=%d pairs=%d  built_from=%s"
           % (d["files"], d["terms"], d["pairs"], d["built_from"]))
-    for t, v in sorted(d["index"].items(), key=lambda kv: -len(kv[1]))[:10]:
+    top = sorted(d["index"].items(), key=lambda kv: -len(kv[1]))[:10]
+    for t, v in top:
         print("  %-14s %d files" % (t, len(v)))
 
 
 def coverage():
-    """对比日记日期 与 index.md 里出现过的日期/文件名。"""
     idx_path = os.path.join(MEM, "index.md")
-    idx = open(idx_path, encoding="utf-8", errors="ignore").read() if os.path.exists(idx_path) else ""
+    idx = ""
+    if os.path.exists(idx_path):
+        with open(idx_path, encoding="utf-8", errors="ignore") as f:
+            idx = f.read()
     diaries = [fn for fn in list_md() if DATE.match(fn)]
-    missing = [fn for fn in diaries
-               if fn[:10] not in idx and fn not in idx]
+    missing = [fn for fn in diaries if fn[:10] not in idx and fn not in idx]
     print("日记 %d 篇；index.md 未收录 %d 篇" % (len(diaries), len(missing)))
     for fn in missing:
         print("  -", fn)

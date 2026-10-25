@@ -61,9 +61,12 @@ python3 bin/amas_index.py coverage   # 日记日期 vs index.md 收录差
 - **只读**：永不改动任何 .md。
 - 两遍扫描：先算全局 document frequency，再对每个文件保留「高频词 top 60 ∪ 稀有词（df ≤ 5）」，
   这样 `contam_chain.sh` 这类只出现在少数文件的专名不会因上限被截掉。
-- 查询带前缀/包含回退：`contam_chain` 能命中 `contam_chain.sh`。
+- **tf·idf 排序**（v3）：抑制大文件偏置；df > 40% 文件的泛词（benmo / pi / memory）自动降权到 0.15。
+- **中文 2-gram 回退**（v3）：`OOM内存` 这种无分隔查询，整体查不到就拆 bigram 再排。
+- **包含回退**（v3）：`contam_chain` 命中 `contam_chain.sh`。
 
-实测（277 个 md）：构建 0.6s，倒排表 3.5MB / 69k 词 / 105k 对，查询 0.1s 级。
+实测（277 个 md）：构建 0.6s，倒排表 4.9MB / 69k 词 / 105k 对，查询 0.1s 级。
+9 条样例查询全部命中预期文件（污染→10-23、OOM→10-20、contam_chain→10-24、小畜→10-23…）。
 
 ## 已知局限
 
